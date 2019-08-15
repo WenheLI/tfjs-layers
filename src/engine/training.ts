@@ -27,6 +27,7 @@ import * as losses from '../losses';
 import * as Metrics from '../metrics';
 import * as optimizers from '../optimizers';
 import {LossOrMetricFn} from '../types';
+import {checkUserDefinedMetadata} from '../user_defined_metadata';
 import {count, pyListRepeat, singletonOrArray, toCamelCase, toSnakeCase, unique} from '../utils/generic_utils';
 import {printSummary} from '../utils/layer_utils';
 import {range} from '../utils/math_utils';
@@ -506,6 +507,9 @@ export class LayersModel extends Container implements tfc.InferenceModel {
   //   implicit "knowledge" of the outputs it depends on.
   metricsTensors: Array<[LossOrMetricFn, number]>;
 
+  // User defind metadata (if any).
+  private userDefinedMetadata: {};
+
   constructor(args: ContainerArgs) {
     super(args);
     this.isTraining = false;
@@ -837,8 +841,8 @@ export class LayersModel extends Container implements tfc.InferenceModel {
     // TODO(cais): Standardize `config.sampleWeights` as well.
     // Validate user data.
     const checkBatchAxis = true;
-    const standardizedOuts = this.standardizeUserDataXY(
-        x, y, checkBatchAxis, batchSize);
+    const standardizedOuts =
+        this.standardizeUserDataXY(x, y, checkBatchAxis, batchSize);
     try {
       // TODO(cais): If uses `useLearningPhase`, set the corresponding element
       // of the input to 0.
@@ -1122,22 +1126,23 @@ export class LayersModel extends Container implements tfc.InferenceModel {
    * });
    * model.predictOnBatch(tf.ones([8, 10])).print();
    * ```
-   * @param x: Input samples, as an Tensor
+   * @param x: Input samples, as an Tensor (for models with exactly one
+   *   input) or an array of Tensors (for models with more than one input).
    * @return Tensor(s) of predictions
    */
   /** @doc {heading: 'Models', subheading: 'Classes'} */
-  predictOnBatch(x: Tensor): Tensor|Tensor[] {
+  predictOnBatch(x: Tensor|Tensor[]): Tensor|Tensor[] {
     checkInputData(x, this.inputNames, this.feedInputShapes, true);
     // TODO(cais): Take care of the learning_phase boolean flag.
     //   if (this.useLearningPhase) ...
-    return this.predictLoop(x, x.shape[0]);
+    const batchSize = (Array.isArray(x) ? x[0] : x).shape[0];
+    return this.predictLoop(x, batchSize);
   }
 
   protected standardizeUserDataXY(
-    x: Tensor|Tensor[]|{[inputName: string]: Tensor},
-    y: Tensor|Tensor[]|{[inputName: string]: Tensor},
-    checkBatchAxis = true,
-    batchSize?: number): [Tensor[], Tensor[]] {
+      x: Tensor|Tensor[]|{[inputName: string]: Tensor},
+      y: Tensor|Tensor[]|{[inputName: string]: Tensor}, checkBatchAxis = true,
+      batchSize?: number): [Tensor[], Tensor[]] {
     // TODO(cais): Add sampleWeight, classWeight
     if (this.optimizer_ == null) {
       throw new RuntimeError(
@@ -1346,8 +1351,9 @@ export class LayersModel extends Container implements tfc.InferenceModel {
           } else {
             const metric = this.metricsTensors[i][0];
             const outputIndex = this.metricsTensors[i][1];
-            weightedMetric = tfc.mean(
-                metric(targets[outputIndex], outputs[outputIndex])) as Scalar;
+            weightedMetric =
+                tfc.mean(metric(targets[outputIndex], outputs[outputIndex])) as
+                Scalar;
           }
 
           tfc.keep(weightedMetric);
@@ -1545,7 +1551,7 @@ export class LayersModel extends Container implements tfc.InferenceModel {
    * @returns A `NamedTensorMap` mapping original weight names (i.e.,
    *   non-uniqueified weight names) to their values.
    */
-  protected getNamedWeights(config?: io.SaveConfig): NamedTensor [] {
+  protected getNamedWeights(config?: io.SaveConfig): NamedTensor[] {
     const namedWeights: NamedTensor[] = [];
 
     const trainableOnly = config != null && config.trainableOnly;
@@ -1640,7 +1646,8 @@ export class LayersModel extends Container implements tfc.InferenceModel {
     } else {
       const outputNames = Object.keys(this.loss);
       lossNames = {} as {[outputName: string]: LossIdentifier};
-      const losses = this.loss as {[outputName: string]: LossOrMetricFn|string};
+      const losses =
+          this.loss as {[outputName: string]: LossOrMetricFn | string};
       for (const outputName of outputNames) {
         if (typeof losses[outputName] === 'string') {
           lossNames[outputName] =
@@ -1648,7 +1655,6 @@ export class LayersModel extends Container implements tfc.InferenceModel {
         } else {
           throw new Error('Serialization of non-string loss is not supported.');
         }
-
       }
     }
     return lossNames;
@@ -1720,8 +1726,8 @@ export class LayersModel extends Container implements tfc.InferenceModel {
     } else if (trainingConfig.metrics != null) {
       metrics = {} as {[outputName: string]: MetricsIdentifier};
       for (const key in trainingConfig.metrics) {
-        metrics[key] = toCamelCase(trainingConfig.metrics[key]) as
-            MetricsIdentifier;
+        metrics[key] =
+            toCamelCase(trainingConfig.metrics[key]) as MetricsIdentifier;
       }
     }
 
@@ -1854,9 +1860,44 @@ export class LayersModel extends Container implements tfc.InferenceModel {
           [weightDataAndSpecs.data, optimizerWeightData]);
     }
 
+    if (this.userDefinedMetadata != null) {
+      // Check serialized size of user-defined metadata.
+      const checkSize = true;
+      checkUserDefinedMetadata(this.userDefinedMetadata, this.name, checkSize);
+      modelArtifacts.userDefinedMetadata = this.userDefinedMetadata;
+    }
+
     modelArtifacts.weightData = weightDataAndSpecs.data;
     modelArtifacts.weightSpecs = weightDataAndSpecs.specs;
     return handlerOrURL.save(modelArtifacts);
+  }
+
+  /**
+   * Set user-defined metadata.
+   *
+   * The set metadata will be serialized together with the topology
+   * and weights of the model during `save()` calls.
+   *
+   * @param setUserDefinedMetadata
+   */
+  setUserDefinedMetadata(userDefinedMetadata: {}): void {
+    checkUserDefinedMetadata(userDefinedMetadata, this.name);
+    this.userDefinedMetadata = userDefinedMetadata;
+  }
+
+  /**
+   * Get user-defined metadata.
+   *
+   * The metadata is supplied via one of the two routes:
+   *   1. By calling `setUserDefinedMetadata()`.
+   *   2. Loaded during model loading (if the model is constructed
+   *      via `tf.loadLayersModel()`.)
+   *
+   * If no user-defined metadata is available from either of the
+   * two routes, this function will return `undefined`.
+   */
+  getUserDefinedMetadata(): {} {
+    return this.userDefinedMetadata;
   }
 }
 serialization.registerClass(LayersModel);
